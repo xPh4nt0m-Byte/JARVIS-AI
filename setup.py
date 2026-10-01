@@ -1,17 +1,4 @@
-"""
-MARK LIV — one-time setup.
 
-Installs the Python dependencies for THIS operating system only: the OS-specific
-packages in requirements.txt carry `sys_platform` markers, so a macOS or Linux
-user never pulls Windows-only libraries (and vice-versa). Then it fetches the
-Playwright browsers needed for web automation (current-OS builds only).
-
-Two things it deliberately does NOT install:
-  * the optional local wake word ("Hey Jarvis") — one-click, opt-in, from
-    ⚙ → WAKE WORD inside the app;
-  * anything for the avatar — the holographic head renders in software on the
-    PyQt6 and numpy already listed here. No GPU, no OpenGL, no extra packages.
-"""
 import platform
 import subprocess
 import sys
