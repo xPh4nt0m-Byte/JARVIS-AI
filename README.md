@@ -282,7 +282,7 @@ python main.py
 ## 🗂️ Project Structure
 
 ```
-Mark LV/
+JARVIS-AI/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, viseme extraction, tool dispatch
 ├── ui.py                     # PyQt6 HUD — avatar canvas, waveform, log panel, settings drawer, camera feed
 ├── setup.py                  # OS-aware installer (skips wrong-OS dependencies, checks your Python)
@@ -344,7 +344,7 @@ Mark LV/
 
 ## 🔒 Your Data
 
-Everything stays on your machine. There is no MARK server, no telemetry and no account.
+Everything stays on your machine. There is no JARVIS server, no telemetry and no account.
 
 | What | Where | Notes |
 |---|---|---|
