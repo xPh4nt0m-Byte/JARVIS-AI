@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>JARVIS Dashboard</title>
-  <script src="/static/crypto.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -138,7 +137,7 @@
   <header>
     <div class="logo"><em>J</em>ARVIS</div>
     <div class="pill" id="pill"><span class="dot"></span><span id="st">Connecting</span></div>
-    <div class="enc-badge" id="enc">AES-256</div>
+    <div class="enc-badge" id="enc">AES-GCM</div>
     <div class="spacer"></div>
     <div class="url">__IP__:__PORT__</div>
   </header>
@@ -167,38 +166,76 @@
       return fetch(url, opts);
     }
 
-    // ── AES-256-CBC encryption (CryptoJS) ────────────────────────────────────
-    const _AES_SALT = 'JARVIS-DASHBOARD-v1';
+    // ── AES-256-GCM encryption (Web Crypto) ──────────────────────────────────
+    //
+    // WHAT CHANGED, AND WHY THE LIBRARY WENT WITH IT
+    //   This used CryptoJS with AES-CBC and a key of SHA256(pairingKey+salt).
+    //   Two problems, both on the server side of the same conversation:
+    //
+    //   CBC hides a message but does not authenticate it, so an attacker on the
+    //   same network could alter the ciphertext and the assistant would act on
+    //   whatever fell out. GCM refuses a message that has been touched.
+    //
+    //   One round of SHA-256 over an eight-character key is an offline search
+    //   measured in seconds on a GPU. PBKDF2 at 200k rounds makes each guess
+    //   about a hundred thousand times more expensive, and costs this page one
+    //   derivation at pairing time.
+    //
+    //   Both are native in Web Crypto, so the 60 KB CryptoJS bundle is no
+    //   longer needed. crypto.subtle exists only in a secure context, which is
+    //   why the server now insists on HTTPS instead of quietly falling back.
+    const _AES_SALT   = 'JARVIS-DASHBOARD-v1';
+    const _KDF_ROUNDS = 200000;
     let _aesKey = null;
 
-    function _initCrypto(key) {
-      if (typeof CryptoJS === 'undefined') return false;
-      _aesKey = CryptoJS.SHA256(key + _AES_SALT);
-      return true;
+    async function _initCrypto(key) {
+      if (!window.crypto || !crypto.subtle) return false;
+      try {
+        const enc  = new TextEncoder();
+        const base = await crypto.subtle.importKey(
+          'raw', enc.encode(key), 'PBKDF2', false, ['deriveKey']);
+        _aesKey = await crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: enc.encode(_AES_SALT),
+            iterations: _KDF_ROUNDS, hash: 'SHA-256' },
+          base, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+        return true;
+      } catch { return false; }
     }
 
-    function _encrypt(plaintext) {
-      if (!_aesKey || typeof CryptoJS === 'undefined') return null;
+    async function _encrypt(plaintext) {
+      if (!_aesKey) return null;
       try {
-        const iv  = CryptoJS.lib.WordArray.random(16);
-        const enc = CryptoJS.AES.encrypt(
-          CryptoJS.enc.Utf8.parse(plaintext), _aesKey,
-          { iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }
-        );
-        const ivHex = iv.toString(CryptoJS.enc.Hex);
-        const ctHex = enc.ciphertext.toString(CryptoJS.enc.Hex);
-        const hex   = ivHex + ctHex;
-        const bytes = new Uint8Array(hex.length / 2);
-        for (let i = 0; i < bytes.length; i++)
-          bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-        return btoa(String.fromCharCode(...bytes));
+        // A fresh 12-byte nonce per message. Reusing one under the same key is
+        // the single way to break GCM, so it is generated here and never
+        // stored, cached or derived from anything.
+        const nonce = crypto.getRandomValues(new Uint8Array(12));
+        const ct    = new Uint8Array(await crypto.subtle.encrypt(
+          { name: 'AES-GCM', iv: nonce },
+          _aesKey, new TextEncoder().encode(plaintext)));
+        const out = new Uint8Array(nonce.length + ct.length);
+        out.set(nonce, 0);
+        out.set(ct, nonce.length);
+        let bin = '';
+        for (const b of out) bin += String.fromCharCode(b);
+        return btoa(bin);
       } catch { return null; }
     }
 
-    const _encReady = _sessionKey ? _initCrypto(_sessionKey) : false;
-    const encBadge  = document.getElementById('enc');
-    if (_encReady) { encBadge.className = 'enc-badge on'; }
-    else           { encBadge.className = 'enc-badge off'; encBadge.textContent = 'NO ENC'; }
+    let _encReady  = false;
+    const encBadge = document.getElementById('enc');
+    encBadge.textContent = 'AES-GCM';
+    // Deriving the key is PBKDF2 over 200k rounds, so it is awaited rather than
+    // done inline — on a phone that is a few hundred milliseconds, and blocking
+    // the parse for it would stall the whole page.
+    (async () => {
+      _encReady = _sessionKey ? await _initCrypto(_sessionKey) : false;
+      if (_encReady) {
+        encBadge.className = 'enc-badge on';
+      } else {
+        encBadge.className = 'enc-badge off';
+        encBadge.textContent = 'NO ENC';
+      }
+    })();
 
     // ── WebSocket ─────────────────────────────────────────────────────────────
     const feed  = document.getElementById('feed');
@@ -372,13 +409,13 @@
     });
 
     // ── Commands ──────────────────────────────────────────────────────────────
-    function doSend() {
+    async function doSend() {
       const inp = document.getElementById('inp');
       const txt = inp.value.trim();
       if (!txt) return;
       inp.value = '';
       append('user', txt);
-      const enc  = _encrypt(txt);
+      const enc  = await _encrypt(txt);
       const body = enc ? { enc } : { text: txt };
       _authFetch('/api/command', {
         method: 'POST',
