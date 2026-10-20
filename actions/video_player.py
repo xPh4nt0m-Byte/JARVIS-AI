@@ -280,7 +280,7 @@ TOOL = {
         "Plays a VIDEO on the assistant's own display, where the avatar "
         "normally is — and stops it, mutes it or unmutes it. Use whenever the "
         "user wants to WATCH something on screen: 'play the new Dune trailer', "
-        "'şu videoyu oynat', 'play C:/clips/holiday.mp4', 'put that YouTube "
+        "'play that video', 'play C:/clips/holiday.mp4', 'put that YouTube "
         "video on the screen', 'stop the video', 'videoyu kapat', 'turn the "
         "sound on', 'sesi aç', 'mute it'. Accepts a local file path, a direct "
         "video URL, a YouTube link, or a description to search YouTube for. "
@@ -292,6 +292,11 @@ TOOL = {
         "Do NOT use 'youtube_video' for this: that optional plugin opens videos "
         "in the web browser and summarises transcripts, it never plays anything "
         "on the assistant's display."
+    ),
+    # Used in place of `description` only when a small model is on a tool
+    # budget - Gemini still gets the full text. See providers/schema.py.
+    "brief": (
+        "Plays a video on the HUD - a YouTube link, a local file, a URL, or a description to search for."
     ),
     "parameters": {
         "type": "OBJECT",

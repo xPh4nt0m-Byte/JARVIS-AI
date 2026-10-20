@@ -467,7 +467,7 @@ def _process_code(path: Path, action: str, params: dict, speak=None) -> str:
             try:
                 result = subprocess.run(
                     ["python", str(path)],
-                    capture_output=True, text=True, timeout=30
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
                 )
                 out = result.stdout or result.stderr
                 return f"Output:\n{out[:2000]}" if out else "No output."
@@ -602,7 +602,7 @@ def _process_video(path: Path, action: str, params: dict, speak=None) -> str:
             result = subprocess.run(
                 ["ffprobe", "-v", "quiet", "-print_format", "json",
                  "-show_format", "-show_streams", str(path)],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10
             )
             data     = json.loads(result.stdout)
             fmt      = data.get("format", {})
@@ -781,6 +781,9 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
 
     return f"Unknown PPTX action: '{action}'. Try: summarize, extract_text, analyze"
 
+from core import outcome
+
+
 def file_processor(parameters: dict, player=None, speak=None) -> str:
     file_path_str = parameters.get("file_path", "").strip()
     if not file_path_str:
@@ -834,7 +837,13 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
 
     try:
         result = handler(path, action, params, speak)
-        return result or "Done."
+        # A document's contents are not the user speaking. A PDF, a spreadsheet
+        # or a text file can carry anything its author put there, including a
+        # sentence addressed to whatever reads it — so what comes out of one
+        # goes to the model marked as data. See core/outcome.untrusted().
+        return outcome.untrusted(f"file:{path.suffix.lstrip('.') or 'text'}",
+                                 result) if result else outcome.done(
+            "file_processor", file=path.name, note="nothing to report")
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -845,6 +854,12 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
 TOOL = {
     "name": "file_processor",
     "description": "Processes any file that the user has uploaded or dropped onto the interface. Use this when the user refers to an uploaded file and wants an action on it. Supports: images (describe/ocr/resize/compress/convert), PDFs (summarize/extract_text/to_word), Word docs & text files (summarize/fix/reformat/translate), CSV/Excel (analyze/stats/filter/sort/convert), JSON/XML (validate/format/analyze), code files (explain/review/fix/optimize/run/document/test), audio (transcribe/trim/convert/info), video (trim/extract_audio/extract_frame/compress/transcribe/info), archives (list/extract), presentations (summarize/extract_text). ALWAYS call this tool when a file has been uploaded and the user gives a command about it. If the user's command is ambiguous, pick the most logical action for that file type.",
+    # Used in place of `description` only when a small model is on a tool
+    # budget - Gemini still gets the full text. See providers/schema.py.
+    "brief": (
+        "Reads a local file and answers questions about it or summarises it. Put the path in 'path' and what is wanted in 'query'."
+    ),
+    "tier": "core",
     "parameters": {
         "type": "OBJECT",
         "properties": {

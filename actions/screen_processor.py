@@ -15,11 +15,15 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    import cv2
-    _CV2 = True
-except ImportError:
-    _CV2 = False
+from core.lazyimport import LazyModule, installed
+
+# OpenCV is 224 ms and is only ever touched by the webcam path — see
+# core/lazyimport.py. Screen capture, which is what this action does on almost
+# every call, never reaches it. numpy above stays eager: main.py already
+# imports it for audio, so it is in memory before this file is read.
+_CV2 = installed("cv2")
+
+cv2 = LazyModule("cv2")
 
 try:
     import mss

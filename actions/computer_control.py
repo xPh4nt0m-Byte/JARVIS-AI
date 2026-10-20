@@ -15,19 +15,24 @@ import time
 import random
 from pathlib import Path
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.05
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+from core import appidentity, outcome
+from core.lazyimport import LazyModule, installed
 
-try:
-    import pyperclip
-    _PYPERCLIP = True
-except ImportError:
-    _PYPERCLIP = False
+# pyautogui and pyperclip are imported on first USE, not at launch — see
+# core/lazyimport.py for why and for what stays the same. The flags still mean
+# "is it installed?" and still answer without importing anything.
+_PYAUTOGUI = installed("pyautogui")
+_PYPERCLIP = installed("pyperclip")
+
+
+def _configure_pyautogui(module) -> None:
+    """Settings that used to sit beside the import, run once when it happens."""
+    module.FAILSAFE = True
+    module.PAUSE    = 0.05
+
+
+pyautogui = LazyModule("pyautogui", _configure_pyautogui)
+pyperclip = LazyModule("pyperclip")
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -76,8 +81,22 @@ def _safe_screenshot_path(requested: str | None) -> Path:
     return fallback
 
 def _require_pyautogui():
+    """Refuse early, with the sentence that says what to install.
+
+    The import itself is the module `__getattr__`'s job; this stays exactly
+    what it was — the check that turns a missing optional dependency into an
+    instruction rather than a traceback.
+    """
     if not _PYAUTOGUI:
         raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+
+
+def _require_pyperclip() -> bool:
+    """Is the clipboard usable? Returns a bool rather than raising, because
+    every caller already has a hotkey fallback written for the case where it
+    is not — turning that into an exception would break the path built to
+    survive it."""
+    return _PYPERCLIP
 
 _FIRST_NAMES = [
     "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Drew", "Quinn",
@@ -167,7 +186,7 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
         _clear_field()
         time.sleep(0.1)
 
-    if len(text) > 20 and _PYPERCLIP:
+    if len(text) > 20 and _require_pyperclip():
         pyperclip.copy(text)
         time.sleep(0.1)
         paste_key = "command" if _get_os() == "mac" else "ctrl"
@@ -221,7 +240,7 @@ def _drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:
 
 
 def _clipboard_get() -> str:
-    if _PYPERCLIP:
+    if _require_pyperclip():
         return pyperclip.paste()
     _hotkey("ctrl", "c")
     time.sleep(0.2)
@@ -229,7 +248,7 @@ def _clipboard_get() -> str:
 
 
 def _clipboard_paste(text: str) -> str:
-    if _PYPERCLIP:
+    if _require_pyperclip():
         pyperclip.copy(text)
         time.sleep(0.1)
         _require_pyautogui()
@@ -309,6 +328,133 @@ def _focus_window(title: str) -> str:
             return f"focus_window (Linux) failed: {e}"
 
     return f"focus_window: unknown OS '{os_name}'"
+
+def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
+    """Close the application the user named — that one, and never this one.
+
+    THE BUG THIS REPLACES
+        `computer_settings.close_app` was two lines:
+
+            if _OS == "Darwin": pyautogui.hotkey("command", "q")
+            else:               pyautogui.hotkey("alt", "f4")
+
+        No target. It sent Alt+F4 to whatever window had focus, and while
+        somebody is talking to the assistant the window with focus is very
+        often the assistant — which is why people reported that asking it to
+        close an app closed JARVIS itself. It also returned nothing at all, so
+        the model announced a success it had no information about.
+
+        The keystroke is not fixable by aiming it better. "The focused window"
+        is the wrong idea: the user named an application, so the application is
+        what should be found and asked to close.
+
+    HOW THIS ONE BEHAVES
+        * The name is matched against what is actually RUNNING — no list of
+          applications, so anything on any machine in any country works.
+        * The assistant's own process tree is never a candidate. When the only
+          thing matching is the assistant, that is said out loud rather than
+          obeyed.
+        * Two equally good matches is a question, not a coin toss. Closing the
+          wrong window loses somebody's unsaved work.
+        * It asks politely — WM_CLOSE on Windows, SIGTERM elsewhere — so an
+          application with unsaved changes gets to say so, and it NEVER
+          escalates to a kill.
+        * It then checks whether the process is gone, and answers `done` only
+          if it is.
+    """
+    app_name = (app_name or "").strip()
+    if not app_name:
+        return outcome.failed("close_app", "no application name was given")
+
+    if not appidentity._PSUTIL:
+        return outcome.failed(
+            "close_app",
+            "psutil is not installed, so running applications cannot be found "
+            "- run: pip install psutil",
+            app=app_name,
+        )
+
+    matches = appidentity.running(app_name)
+
+    if not matches:
+        # Nothing, or nothing that is not us. Telling those two apart matters:
+        # "it is not running" and "the only thing by that name is me" need
+        # completely different sentences.
+        including_self = appidentity.running(app_name, include_self=True)
+        if any(m.is_self for m in including_self):
+            return outcome.failed(
+                "close_app",
+                "the only thing matching that name is the assistant itself, "
+                "and it will not close itself - if the user really wants the "
+                "assistant closed they should close its window themselves",
+                app=app_name,
+            )
+        return outcome.failed(
+            "close_app",
+            "no running application matches that name - it may already be "
+            "closed, or be running under a different name",
+            app=app_name,
+        )
+
+    # Group by process NAME, because twenty `opera.exe` are one application
+    # with nineteen helpers, not twenty applications — and closing "Opera"
+    # means all of them. `matches` is already best-first, so insertion order
+    # here ranks the groups.
+    by_name: dict[str, list] = {}
+    for match in matches:
+        by_name.setdefault(match.label, []).append(match)
+
+    ranked = list(by_name.items())          # [(name, [matches...]), ...]
+    target_name, group = ranked[0]
+
+    # Two DIFFERENT applications that answer equally well is a question, not a
+    # coin toss. Only when they tie: "discord" beating "discordcanary" on an
+    # exact match is a clear winner and interrupting the user to confirm it
+    # would be the assistant refusing to do an unambiguous thing.
+    if len(ranked) > 1 and not confirmed_index:
+        best_score = group[0].score
+        tied = [name for name, ms in ranked if ms[0].score == best_score]
+        if len(tied) > 1:
+            return outcome.ask(
+                "close_app",
+                f"more than one application matches '{app_name}' equally well: "
+                f"{', '.join(tied[:4])} - which one should be closed?",
+                app=app_name, candidates=len(tied),
+            )
+        print(f"[ComputerControl] close_app: '{app_name}' -> {target_name} "
+              f"(also matched: {', '.join(n for n, _ in ranked[1:5])})")
+
+    closed, still_open, reason = 0, 0, ""
+    for match in group:
+        gone, detail = appidentity.request_close(match)
+        if gone:
+            closed += 1
+        else:
+            still_open += 1
+            reason = reason or detail
+
+    if closed and not still_open:
+        return outcome.done(
+            "close_app", app=app_name, closed=target_name,
+            processes=closed, verified=True,
+        )
+
+    if closed and still_open:
+        # Partly gone. Common and benign for multi-process applications: the
+        # window is shut and a background helper is taking its time. Said as
+        # `unverified` because that is exactly what it is.
+        return outcome.unverified(
+            "close_app",
+            f"{closed} of {closed + still_open} processes closed; the rest are "
+            f"still running - {reason}",
+            app=app_name, closed=target_name,
+        )
+
+    return outcome.failed(
+        "close_app", reason or "the application did not close",
+        app=app_name, matched=target_name,
+    )
+
 
 def _screen_find(description: str) -> tuple[int, int] | None:
     api_key = _get_api_key()
@@ -410,7 +556,10 @@ def computer_control(
         return "No action specified for computer_control."
 
     if player:
-        player.write_log(f"[Computer] {action}")
+        # Terminal, not the HUD: the activity log is for the conversation and
+        # for problems, not a receipt for every keystroke. See
+        # core/outcome.is_problem().
+        print(f"[ComputerControl] {action}")
 
     print(f"[ComputerControl] ▶ {action}  {params}")
 
@@ -491,6 +640,12 @@ def computer_control(
         if action == "focus_window":
             return _focus_window(params.get("title", ""))
 
+        if action in ("close_app", "close_application", "quit_app"):
+            return _close_app(
+                params.get("app_name") or params.get("text") or "",
+                confirmed_index=params.get("confirmed"),
+            )
+
         if action == "random_data":
             dt     = params.get("type", "name")
             result = _random_data(dt)
@@ -516,13 +671,46 @@ def computer_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_control",
-    "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+    "description": (
+        "Direct computer control: type, click, hotkeys, scroll, move mouse, "
+        "screenshots, find elements on screen, and CLOSE an application. "
+        "Use action='close_app' with 'app_name' whenever the user asks to "
+        "close, quit or exit a program - 'close Spotify', 'quit Chrome'. "
+        "Always name the application in 'app_name'; there is no action that "
+        "closes 'whatever is in front', because that is usually the assistant. "
+        "To OPEN an application use the open_app tool instead. "
+        "Read the status the tool returns: 'done' means it was confirmed, "
+        "'unverified' means it was requested and could NOT be confirmed - say "
+        "so rather than claiming success - and 'ask' means nothing was done "
+        "and the question must go to the user first."
+    ),
+    # Used in place of `description` only when a small model is on a tool
+    # budget - Gemini still gets the full text. See providers/schema.py.
+    "brief": (
+        "Controls the computer: type, click, hotkeys, scroll, screenshots, and close_app to close a named application (put its name in 'app_name'). Use open_app to open one."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"
+                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | close_app | screen_find | screen_click | random_data | user_data"
+            },
+            "app_name": {
+                "type": "STRING",
+                "description": (
+                    "For close_app: the application to close, named as the "
+                    "user said it. Any application running on the machine "
+                    "works - there is no fixed list. Never leave this empty."
+                )
+            },
+            "confirmed": {
+                "type": "BOOLEAN",
+                "description": (
+                    "For close_app: set true only after the tool asked which "
+                    "application was meant AND the user answered. Pass their "
+                    "answer in 'app_name'."
+                )
             },
             "text": {
                 "type": "STRING",

@@ -657,7 +657,7 @@ def file_controller(
     name   = params.get("name", "")
 
     if player:
-        player.write_log(f"[file] {action} {name or path}")
+        print(f"[File] {action} {name or path}")  # terminal, not the HUD
 
     try:
         if action == "list":

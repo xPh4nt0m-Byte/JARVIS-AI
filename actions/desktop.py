@@ -9,11 +9,11 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+from core import outcome
+
+# pyautogui is gone from this file along with the generated-code sandbox that
+# was the only thing using it — see the note below. Nothing here drives the
+# mouse or the keyboard any more; that is computer_control's job.
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -35,125 +35,77 @@ def _get_desktop() -> Path:
             return Path(xdg)
     return Path.home() / "Desktop"
 
-def _build_sandbox() -> dict:
-    import time
-
-    safe_builtins = {
-        "print": print,
-        "len": len, "str": str, "int": int, "float": float,
-        "bool": bool, "list": list, "dict": dict, "tuple": tuple,
-        "range": range, "enumerate": enumerate, "sorted": sorted,
-        "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
-        "max": max, "min": min, "sum": sum, "abs": abs,
-        "zip": zip, "map": map, "filter": filter,
-    }
-
-    sandbox = {
-        "__builtins__": safe_builtins,
-        "Path": Path,
-        "time": time,
-        "shutil": type("shutil", (), {
-            "copy2":      shutil.copy2,
-            "copytree":   shutil.copytree,
-            "disk_usage": shutil.disk_usage,
-        })(),
-        "os_path": os.path,  
-    }
-
-    if _PYAUTOGUI:
-        sandbox["pyautogui"] = pyautogui
-
-    if _OS == "Windows":
-        try:
-            import ctypes
-            import winreg
-            sandbox["ctypes"] = ctypes
-            sandbox["winreg"] = type("winreg", (), {
-                # Sadece okuma
-                "OpenKey":      winreg.OpenKey,
-                "QueryValueEx": winreg.QueryValueEx,
-                "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
-            })()
-        except ImportError:
-            pass
-
-    return sandbox
+# ─────────────────────────────────────────────────────────────────────────────
+#  REMOVED IN JARVIS-AI: the generated-code path
+# ─────────────────────────────────────────────────────────────────────────────
+# This file used to carry three functions the rest of the project has no
+# equivalent of: `_ask_gemini_for_desktop_action` asked Gemini to write Python
+# for whatever the user described, `_build_sandbox` assembled a namespace, and
+# `_execute_generated_code` ran the result with exec().
+#
+# WHY IT WENT
+#     The sandbox was not one. Its rules — "NO subprocess", "NO file deletion",
+#     "NO import statements" — were sentences in a PROMPT, with nothing in the
+#     code enforcing any of them, and the namespace handed the generated code
+#     `getattr`, the real `pathlib.Path`, `pyautogui` and, on Windows, `ctypes`.
+#     Verified rather than assumed: from inside that namespace,
+#     `getattr(getattr(().__class__, "__bases__")[0], "__subclasses__")()`
+#     reaches `subprocess.Popen` in one line, and `Path.unlink` was never
+#     hidden at all. The only thing standing between a stray instruction and
+#     arbitrary code on the user's machine was the model choosing to behave.
+#
+#     It was also the one tool in this project that broke its own architecture.
+#     Every other one of the thirty-eight declares typed parameters and lets the
+#     model FILL THEM IN; this one asked the model to emit a program. The rest
+#     of the file — wallpaper, organize, clean, list, stats — was already doing
+#     it the right way, and those are what remain.
+#
+# WHAT REPLACED IT
+#     Nothing new, because nothing was missing. Typing, clicking, hotkeys,
+#     scrolling, screenshots and find-on-screen are `computer_control`; a
+#     multi-step job on the screen is the `screen_agent` plugin; files are
+#     `file_controller`. All of them are typed, checked and reversible in a way
+#     generated code never was.
+#
+#     An action this file does not recognise is now a failure that names the
+#     ones it does — the shape computer_settings has used since JARVIS-AI —
+#     rather than a prompt asking a model to invent something.
 
 
-def _execute_generated_code(code: str, player=None) -> str:
-    if not code or code.strip() == "UNSAFE":
-        return "This action cannot be performed safely."
-
-    # Kod temizleme
-    if code.startswith("```"):
-        lines = code.split("\n")
-        code  = "\n".join(lines[1:-1]).strip()
-
-    sandbox      = _build_sandbox()
-    output_lines = []
-    sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
-
-    try:
-        exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
-        return "\n".join(output_lines) if output_lines else "Done."
-    except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
-        return f"Execution error: {e}"
+_ACTIONS = ("wallpaper", "wallpaper_url", "current_wallpaper",
+            "organize", "clean", "list", "stats")
 
 
-def _ask_gemini_for_desktop_action(task: str) -> str:
+def _unknown(said: str) -> str:
+    """An action this file does not have, answered with the ones it does.
 
-    from google import genai as _genai
+    Spelling tolerance rather than a second model call: `difflib` matches
+    "organise" to "organize" and "wallpapers" to "wallpaper" in microseconds,
+    which is the same trick computer_settings uses for its fifty-six actions.
+    Where the old code sent an unrecognised string to Gemini to have Python
+    written for it, this says what is available and stops.
+    """
+    import difflib
+    guess = difflib.get_close_matches(said.lower().strip(), _ACTIONS, n=1, cutoff=0.6)
+    if guess:
+        return outcome.ask(
+            "desktop_control",
+            f"'{said}' is not a desktop action - did you mean '{guess[0]}'?",
+            said=said,
+        )
+    return outcome.failed(
+        "desktop_control",
+        f"'{said}' is not something this tool does. It handles only: "
+        f"{', '.join(_ACTIONS)}. For typing, clicking or keyboard shortcuts "
+        f"use computer_control; for files use file_controller",
+        said=said,
+    ) if said else outcome.failed(
+        "desktop_control",
+        f"no action was given - choose one of: {', '.join(_ACTIONS)}",
+    )
 
-    desktop = str(_get_desktop())
 
-    os_specific = ""
-    if _OS == "Windows":
-        os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
-    elif _OS == "Darwin":
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-    else:
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-
-    prompt = f"""You are a desktop automation assistant.
-Current OS: {_OS}
-Desktop path: {desktop}
-
-Generate safe Python code to accomplish the task below.
-Allowed modules ONLY:
-- pyautogui (mouse, keyboard — if needed)
-- pathlib.Path (file/folder inspection only, no deletion)
-- shutil.copy2, shutil.copytree, shutil.disk_usage (NO move, NO rmtree)
-- os_path (os.path equivalent, read-only)
-- time.sleep
-{os_specific}
-
-Hard rules:
-- NO file deletion (no unlink, no rmtree, no remove)
-- NO subprocess calls
-- NO exec() or eval() inside the code
-- NO import statements (modules are pre-injected)
-- NO file write operations except explicitly requested
-- If task cannot be done safely with these tools, output exactly: UNSAFE
-
-Output ONLY the Python code. No explanation, no markdown, no backticks.
-
-Task: {task}"""
-
-    try:
-        from core import gemini
-        response = gemini.call(prompt, tier=gemini.SMART, timeout_ms=30_000)
-        if response is None:
-            return "ERROR: every Gemini model on the ladder failed"
-        code = (response.text or "").strip()
-        if code.startswith("```"):
-            lines = code.split("\n")
-            code  = "\n".join(lines[1:-1]).strip()
-        return code
-    except Exception as e:
-        return f"ERROR: {e}"
-
-def set_wallpaper(image_path: str) -> str:
+def _apply_wallpaper(image_path: str) -> str:
     path = Path(image_path).expanduser().resolve()
     if not path.exists():
         return f"Image not found: {image_path}"
@@ -237,6 +189,52 @@ for (var i = 0; i < allDesktops.length; i++) {{
         return f"Could not set wallpaper: {e}"
 
 
+def set_wallpaper(image_path: str) -> str:
+    """Set the wallpaper, then READ IT BACK before saying it worked.
+
+    Every platform call underneath reports only that it accepted the request:
+    Windows' SystemParametersInfoW returns a bool nobody checked, osascript
+    exits 0 whether or not the picture changed, and `feh` succeeds on a file
+    the compositor then ignores. The old code returned "Wallpaper set: x.jpg"
+    off the back of that — and a wallpaper that did not change is the one
+    failure the user can see from across the room.
+
+    `get_current_wallpaper()` already existed for the user to ask with. Using
+    it here costs one registry read and turns a claim into a check.
+
+    Where the desktop environment will not report its wallpaper — several
+    Linux setups — this says `unverified` rather than guessing, because
+    "I set it and cannot confirm" is true and "Wallpaper set" would not be.
+    """
+    applied = _apply_wallpaper(image_path)
+    name = Path(image_path).name
+
+    # The inner function returns its own prose on the paths that never reached
+    # the operating system at all — a missing file, an unsupported format.
+    if not applied.startswith("Wallpaper set"):
+        return outcome.failed("set_wallpaper", applied, image=name)
+
+    reading = get_current_wallpaper()
+    if not reading.startswith("Current wallpaper:"):
+        return outcome.unverified(
+            "set_wallpaper",
+            "this desktop environment does not report its wallpaper, so the "
+            "change could not be read back",
+            image=name,
+        )
+
+    current = reading.split(":", 1)[1].strip()
+    if Path(current).name.lower() == Path(applied.split(":", 1)[1].strip()).name.lower():
+        return outcome.done("set_wallpaper", image=name, verified=True)
+
+    return outcome.unverified(
+        "set_wallpaper",
+        f"the desktop still reports '{Path(current).name}' - the change may "
+        f"need a moment, or this environment may not have accepted it",
+        image=name,
+    )
+
+
 def set_wallpaper_from_url(url: str) -> str:
     try:
         import urllib.request
@@ -250,7 +248,8 @@ def set_wallpaper_from_url(url: str) -> str:
             pass
         return result
     except Exception as e:
-        return f"Could not download wallpaper: {e}"
+        return outcome.failed("set_wallpaper",
+                              f"the image could not be downloaded: {e}", url=url)
 
 
 def get_current_wallpaper() -> str:
@@ -270,7 +269,7 @@ def get_current_wallpaper() -> str:
             )
             result = subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, text=True
+                capture_output=True, text=True, encoding="utf-8", errors="replace"
             )
             return f"Current wallpaper: {result.stdout.strip()}"
 
@@ -279,7 +278,7 @@ def get_current_wallpaper() -> str:
             if "gnome" in desktop_env or "unity" in desktop_env:
                 result = subprocess.run(
                     ["gsettings", "get", "org.gnome.desktop.background", "picture-uri"],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, encoding="utf-8", errors="replace"
                 )
                 return f"Current wallpaper: {result.stdout.strip()}"
             return "Wallpaper path retrieval not supported for this desktop environment."
@@ -433,16 +432,22 @@ def desktop_control(
     task   = params.get("task", "").strip()
 
     if player:
-        player.write_log(f"[desktop] {action or task[:40]}")
+        print(f"[Desktop] {action}")             # terminal, not the HUD
 
     try:
         if action == "wallpaper":
             path = params.get("path", "")
-            return set_wallpaper(path) if path else "No image path provided."
+            if not path:
+                return outcome.failed("desktop_control",
+                                      "no image path was given", wanted=action)
+            return set_wallpaper(path)
 
         elif action == "wallpaper_url":
             url = params.get("url", "")
-            return set_wallpaper_from_url(url) if url else "No URL provided."
+            if not url:
+                return outcome.failed("desktop_control",
+                                      "no image URL was given", wanted=action)
+            return set_wallpaper_from_url(url)
 
         elif action == "current_wallpaper":
             return get_current_wallpaper()
@@ -459,23 +464,7 @@ def desktop_control(
         elif action == "stats":
             return get_desktop_stats()
 
-        elif action == "task" or task:
-            actual_task = task or params.get("description", "")
-            if not actual_task:
-                return "Please describe what you want to do on the desktop."
-
-            print(f"[Desktop] Asking Gemini: {actual_task}")
-            if player:
-                player.write_log("[Desktop] Generating action...")
-
-            code = _ask_gemini_for_desktop_action(actual_task)
-            return _execute_generated_code(code, player=player)
-
-        else:
-            if action:
-                code = _ask_gemini_for_desktop_action(action)
-                return _execute_generated_code(code, player=player)
-            return "No action or task specified."
+        return _unknown(action or params.get("task", ""))
 
     except Exception as e:
         print(f"[Desktop] Error: {e}")
@@ -485,29 +474,47 @@ def desktop_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "desktop_control",
-    "description": "Controls the desktop: wallpaper, organize, clean, list, stats.",
+    "description": (
+        "Controls the DESKTOP itself: the wallpaper, and tidying the files on "
+        "it. Actions: wallpaper (needs 'path') | wallpaper_url (needs 'url') | "
+        "current_wallpaper | organize (needs 'mode': by_type or by_date) | "
+        "clean | list | stats. "
+        "It does ONLY those. For typing, clicking, hotkeys, screenshots or "
+        "closing an application use computer_control; for opening one use "
+        "open_app; for reading, moving or deleting files use file_controller. "
+        "Read the status it returns: 'done' was confirmed, 'unverified' means "
+        "it was requested and could not be checked - say that rather than "
+        "claiming success - and 'ask' means nothing happened and the question "
+        "goes to the user first."
+    ),
+    # Used in place of `description` only when a small model is on a tool
+    # budget - Gemini still gets the full text. See providers/schema.py.
+    "brief": (
+        "Desktop wallpaper and desktop-file tidying. Actions: wallpaper "
+        "(path) | wallpaper_url (url) | current_wallpaper | organize (mode) | "
+        "clean | list | stats. Nothing else - typing and clicking are "
+        "computer_control."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "wallpaper | wallpaper_url | organize | clean | list | stats | task"
+                "description": "wallpaper | wallpaper_url | current_wallpaper | organize | clean | list | stats",
+                "enum": ["wallpaper", "wallpaper_url", "current_wallpaper",
+                         "organize", "clean", "list", "stats"]
             },
             "path": {
                 "type": "STRING",
-                "description": "Image path for wallpaper"
+                "description": "Image file path, for action='wallpaper'"
             },
             "url": {
                 "type": "STRING",
-                "description": "Image URL for wallpaper_url"
+                "description": "Image URL, for action='wallpaper_url'"
             },
             "mode": {
                 "type": "STRING",
-                "description": "by_type or by_date for organize"
-            },
-            "task": {
-                "type": "STRING",
-                "description": "Natural language desktop task"
+                "description": "by_type or by_date, for action='organize'"
             }
         },
         "required": [

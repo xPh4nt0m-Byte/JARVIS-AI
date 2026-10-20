@@ -7,21 +7,23 @@ import subprocess
 import platform
 from pathlib import Path
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.05
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+from core.lazyimport import LazyModule, installed
 
-try:
-    import pyperclip
-    _PYPERCLIP = True
-except ImportError:
-    _PYPERCLIP = False
+# Imported on first USE, not at launch. This file has eighty-six `pyautogui.`
+# call sites; not one of them changes — see core/lazyimport.py.
+_PYAUTOGUI = installed("pyautogui")
+_PYPERCLIP = installed("pyperclip")
 
-from core import confirm
+
+def _configure_pyautogui(module) -> None:
+    module.FAILSAFE = True
+    module.PAUSE    = 0.05
+
+
+pyautogui = LazyModule("pyautogui", _configure_pyautogui)
+pyperclip = LazyModule("pyperclip")
+
+from core import confirm, outcome
 from core.undo import push_undo
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -46,7 +48,7 @@ def _get_macos_wifi_interface() -> str:
     try:
         result = subprocess.run(
             ["networksetup", "-listallhardwareports"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
         )
         lines = result.stdout.splitlines()
         for i, line in enumerate(lines):
@@ -90,6 +92,42 @@ def volume_mute():
         subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
             capture_output=True)
 
+
+def _win_endpoint_volume():
+    """The Windows master-volume interface, across pycaw versions.
+
+    TWO BUGS LIVED HERE, AND NEITHER ANNOUNCED ITSELF.
+
+    1. `AudioUtilities.GetSpeakers()` used to return the raw COM device, and
+       the code called `.Activate(...)` on it. Newer pycaw returns an
+       `AudioDevice` WRAPPER instead, which has no `.Activate` — so every call
+       raised AttributeError, was swallowed by the `except Exception: return
+       None` around it, and `volume_get()` answered "this system does not
+       report its volume" on a system that reports it fine. Undo for volume
+       silently stopped registering, and so did every verification built on it.
+
+    2. The percentage was computed as `10 ** (db / 20) * 100`, which converts
+       decibels to an amplitude RATIO. That is not what the Windows slider
+       shows: the slider is the scalar, and the two disagree by a lot —
+       measured here, scalar 43% against a formula answering 0%.
+
+    So: prefer the wrapper's own `EndpointVolume`, fall back to activating the
+    inner device for older pycaw, and read the scalar rather than deriving a
+    number from decibels.
+    """
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+    speakers = AudioUtilities.GetSpeakers()
+    endpoint = getattr(speakers, "EndpointVolume", None)
+    if endpoint is not None:
+        return endpoint
+    dev = getattr(speakers, "_dev", speakers)
+    return cast(dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None),
+                POINTER(IAudioEndpointVolume))
+
+
 def volume_get() -> int | None:
     """Current master volume 0-100, or None if this platform will not say.
 
@@ -98,23 +136,14 @@ def volume_get() -> int | None:
     undoable — a wrong undo is worse than no undo."""
     try:
         if _OS == "Windows":
-            import math
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            devices   = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            vol       = cast(interface, POINTER(IAudioEndpointVolume))
-            db        = vol.GetMasterVolumeLevel()
-            if db <= -65.0:
-                return 0
-            return max(0, min(100, round(10 ** (db / 20) * 100)))
+            return max(0, min(100, round(
+                _win_endpoint_volume().GetMasterVolumeLevelScalar() * 100)))
         if _OS == "Darwin":
             r = subprocess.run(["osascript", "-e", "output volume of (get volume settings)"],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
             return max(0, min(100, int(r.stdout.strip())))
         r = subprocess.run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
         m = re.search(r"(\d+)%", r.stdout)
         return max(0, min(100, int(m.group(1)))) if m else None
     except Exception:
@@ -129,15 +158,15 @@ def brightness_get() -> int | None:
                 ["powershell", "-Command",
                  "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness)"
                  ".CurrentBrightness"],
-                capture_output=True, text=True, timeout=5, **_WIN_HIDE
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, **_WIN_HIDE
             )
             return max(0, min(100, int(r.stdout.strip())))
         if _OS == "Linux" and subprocess.run(
                 ["which", "brightnessctl"], capture_output=True).returncode == 0:
             cur = int(subprocess.run(["brightnessctl", "get"],
-                                     capture_output=True, text=True, timeout=5).stdout.strip())
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5).stdout.strip())
             mx  = int(subprocess.run(["brightnessctl", "max"],
-                                     capture_output=True, text=True, timeout=5).stdout.strip())
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5).stdout.strip())
             return max(0, min(100, round(cur * 100 / mx))) if mx else None
     except Exception:
         pass
@@ -163,15 +192,10 @@ def volume_set(value: int):
     value = max(0, min(100, int(value)))
     if _OS == "Windows":
         try:
-            import math
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            devices   = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            vol       = cast(interface, POINTER(IAudioEndpointVolume))
-            vol_db    = -65.25 if value == 0 else max(-65.25, 20 * math.log10(value / 100))
-            vol.SetMasterVolumeLevel(vol_db, None)
+            # Scalar, not decibels: this is the number the Windows slider shows,
+            # so "set the volume to 40" lands where the user expects rather than
+            # wherever a dB conversion happens to put it.
+            _win_endpoint_volume().SetMasterVolumeLevelScalar(value / 100.0, None)
             return
         except Exception as e:
             print(f"[Settings] pycaw failed, using keypress fallback: {e}")
@@ -245,8 +269,35 @@ def brightness_down():
             print(f"[Settings] Brightness down failed on Windows: {e}")
 
 def close_app():
-    if _OS == "Darwin": pyautogui.hotkey("command", "q")
-    else:               pyautogui.hotkey("alt", "f4")
+    """Removed. Closing an application now lives in computer_control.
+
+    WHAT THIS USED TO BE, AND WHY IT HAD TO GO
+
+        if _OS == "Darwin": pyautogui.hotkey("command", "q")
+        else:               pyautogui.hotkey("alt", "f4")
+
+    Two lines with no target. It sent the quit chord to WHATEVER WINDOW HAD
+    FOCUS — and while somebody is talking to the assistant, the window with
+    focus is very often the assistant. That is the whole of the bug people
+    reported as "I asked it to close an app and it closed itself".
+
+    It could not be fixed by aiming better. "The focused window" is the wrong
+    idea: the user names an application, so the application is what has to be
+    found. `computer_control` action='close_app' does that — matched against
+    what is actually running, never the assistant's own process tree, asked
+    politely so unsaved work survives, and checked afterwards.
+
+    The function stays as a named refusal rather than disappearing, because a
+    model that learnt the old name from an older prompt will still reach for
+    it, and a KeyError here would surface as "computer_settings failed" with
+    nothing to act on.
+    """
+    return outcome.failed(
+        "close_app",
+        "this action needs to know WHICH application to close - use the "
+        "computer_control tool with action='close_app' and the application's "
+        "name in 'app_name'",
+    )
 
 def close_window():
     if _OS == "Darwin": pyautogui.hotkey("command", "w")
@@ -532,7 +583,7 @@ def dark_mode():
         try:
             result = subprocess.run(
                 ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
-                capture_output=True, text=True
+                capture_output=True, text=True, encoding="utf-8", errors="replace"
             )
             current = result.stdout.strip()
             new_scheme = "'default'" if "dark" in current else "'prefer-dark'"
@@ -548,7 +599,7 @@ def toggle_wifi():
         iface = _get_macos_wifi_interface()
         result = subprocess.run(
             ["networksetup", "-getairportpower", iface],
-            capture_output=True, text=True
+            capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
         state = "off" if "On" in result.stdout else "on"
         subprocess.run(["networksetup", "-setairportpower", iface, state],
@@ -566,7 +617,7 @@ def toggle_wifi():
             print(f"[Settings] toggle_wifi Windows failed: {e}")
     else:
         try:
-            result = subprocess.run(["nmcli", "radio", "wifi"], capture_output=True, text=True)
+            result = subprocess.run(["nmcli", "radio", "wifi"], capture_output=True, text=True, encoding="utf-8", errors="replace")
             state  = "off" if "enabled" in result.stdout else "on"
             subprocess.run(["nmcli", "radio", "wifi", state], capture_output=True)
         except Exception as e:
@@ -778,8 +829,11 @@ def _suggest(description: str) -> str:
     near = difflib.get_close_matches(_normalise(description),
                                      sorted(ACTION_MAP), n=5, cutoff=0.3)
     hint = ", ".join(near) if near else ", ".join(sorted(ACTION_MAP)[:12])
-    return (f"I could not match '{description}' to a computer action. "
-            f"Call computer_settings again with an exact `action` from: {hint}.")
+    return outcome.ask(
+        "computer_settings",
+        f"'{description}' does not match any computer action - the closest "
+        f"are: {hint}. Which was meant?",
+        said=description)
 
 def computer_settings(
     parameters: dict = None,
@@ -788,7 +842,10 @@ def computer_settings(
     session_memory=None,
 ) -> str:
     if not _PYAUTOGUI:
-        return "pyautogui is not installed. Run: pip install pyautogui"
+        return outcome.failed(
+            "computer_settings",
+            "pyautogui is not installed, so the keyboard cannot be driven - "
+            "run: pip install pyautogui")
 
     params      = parameters or {}
     raw_action  = params.get("action", "").strip()
@@ -808,7 +865,7 @@ def computer_settings(
 
     print(f"[Settings] Action: {action}  Value: {value}  OS: {_OS}")
     if player:
-        player.write_log(f"[Settings] {action}")
+        print(f"[Settings] {action}")            # terminal, not the HUD
 
     # ── The gate ─────────────────────────────────────────────────────────────
     # A human presses a button, or this does not happen. The model can no longer
@@ -819,10 +876,15 @@ def computer_settings(
         title, detail = _IRREVERSIBLE[action]
         func = ACTION_MAP.get(action)
         if func is None:
-            return f"Unknown action: '{raw_action}'."
+            return outcome.failed("computer_settings",
+                                  "that is not an action this tool has",
+                                  wanted=raw_action)
         if confirm.pending_title():
-            return ("There is already a confirmation waiting on screen. "
-                    "Ask the user to answer that one first.")
+            return outcome.ask(
+                "computer_settings",
+                "there is already a confirmation waiting on screen - the user "
+                "has to answer that one first",
+                wanted=action)
         return confirm.request(
             key=action, title=title, detail=detail,
             run=lambda f=func, a=action: (f(), f"{a} done.")[1],
@@ -836,39 +898,52 @@ def computer_settings(
             if before is not None:
                 push_undo(f"volume {before}% → {target}%",
                           lambda b=before: (volume_set(b), f"Back to {b}%.")[1])
-            return f"Volume set to {target}%."
+            now = volume_get()
+            if now is None:
+                return outcome.unverified(
+                    "computer_settings",
+                    "this system does not report its volume, so the new "
+                    "level could not be read back", wanted=action, asked=target)
+            return outcome.done("computer_settings", wanted=action,
+                                volume=now, verified=True)
         except Exception as e:
-            return f"Could not set volume: {e}"
+            return outcome.failed("computer_settings",
+                                  f"the volume could not be set: {e}", wanted=action)
 
     if action in ("type_text", "write_on_screen", "type", "write"):
         text = str(value or params.get("text", "")).strip()
         if not text:
-            return "No text provided to type."
+            return outcome.failed("computer_settings",
+                                  "no text was given to type", wanted=action)
         enter_after = str(params.get("press_enter", "false")).lower() in ("true", "1", "yes")
         type_text(text, press_enter_after=enter_after)
-        return f"Typed: {text[:80]}"
+        return outcome.done("computer_settings", wanted=action,
+                            typed=text[:60])
 
     if action == "press_key":
         key = str(value or params.get("key", "")).strip()
         if not key:
-            return "No key specified."
+            return outcome.failed("computer_settings",
+                                  "no key was given to press", wanted=action)
         press_key(key)
-        return f"Pressed: {key}"
+        return outcome.done("computer_settings", wanted=action, key=key)
 
     if action in ("reload_n", "refresh_n", "reload_page_n"):
         try:
             reload_page_n(int(value or 1))
-            return f"Reloaded {value or 1} time(s)."
+            return outcome.done("computer_settings", wanted=action,
+                                times=value or 1)
         except Exception as e:
-            return f"Reload failed: {e}"
+            return outcome.failed("computer_settings",
+                                  f"the reload failed: {e}", wanted=action)
 
     if action == "scroll_up":
         scroll_up(int(value or 500))
-        return "Scrolled up."
+        return outcome.done("computer_settings", wanted=action)
 
     if action == "scroll_down":
         scroll_down(int(value or 500))
-        return "Scrolled down."
+        return outcome.done("computer_settings", wanted=action)
 
     func = ACTION_MAP.get(action)
     if not func:
@@ -889,7 +964,8 @@ def computer_settings(
         func()
     except Exception as e:
         print(f"[Settings] Action failed ({action}): {e}")
-        return f"Action failed ({action}): {e}"
+        return outcome.failed("computer_settings", f"it failed: {e}",
+                              wanted=action)
 
     if _before:
         kind, old = _before
@@ -905,13 +981,58 @@ def computer_settings(
         push_undo("dark mode toggled",
                   lambda: (dark_mode(), "Theme switched back.")[1])
 
-    return f"Done: {action}."
+    # ── Say what is known, and only that ─────────────────────────────────────
+    #
+    # This used to be `return f"Done: {action}."`, sent whether or not anything
+    # had changed, because `func()` returns nothing and nobody looked.
+    #
+    # WHERE THE LINE IS, AND WHY IT IS NOT "VERIFY EVERYTHING"
+    #     Volume and brightness are a state the machine will read back, and the
+    #     "before" value has ALREADY been read two blocks above for undo — so
+    #     checking costs one more call and turns a claim into a fact.
+    #
+    #     Most of the other fifty-odd actions are a keystroke sent to whatever
+    #     has focus, and there is nothing to read. But they are also things the
+    #     user is looking straight at: scrolling, switching tabs, snapping a
+    #     window. Hedging on those would have the assistant say "I sent a scroll
+    #     and cannot confirm it" about something the person just watched happen,
+    #     which is noise dressed as honesty.
+    #
+    #     So the rule is not "verify everything", it is: claim an OUTCOME only
+    #     where the outcome was observed, and otherwise claim only what was
+    #     actually done. `open_app` lied because it reported an application
+    #     opening from a shell starting — two different events. Reporting a
+    #     keystroke as a keystroke is not that.
+    if _before:
+        kind, old_value = _before
+        now = volume_get() if kind == "volume" else brightness_get()
+        if old_value is None or now is None:
+            return outcome.unverified(
+                "computer_settings",
+                f"this system does not report its {kind}, so the change could "
+                f"not be read back",
+                wanted=action)
+        if now == old_value:
+            return outcome.unverified(
+                "computer_settings",
+                f"the {kind} still reads {now}% - it may already have been at "
+                f"the limit, or this system may not have accepted the change",
+                wanted=action, value=now)
+        return outcome.done("computer_settings", wanted=action,
+                            **{kind: now}, verified=True)
+
+    return outcome.done("computer_settings", wanted=action)
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_settings",
     "description": "Controls the computer: volume, brightness, window management, keyboard shortcuts, typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. Use for ANY single computer control command. restart, shutdown and toggle_wifi put a confirmation on the user's screen and do NOT happen until they press it — never claim they are done. Volume, brightness and dark mode can be reversed with the `undo` tool.",
+    # Used in place of `description` only when a small model is on a tool
+    # budget - Gemini still gets the full text. See providers/schema.py.
+    "brief": (
+        "Changes a computer setting: volume, brightness, WiFi, window layout, power. Name the action in 'action'."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -931,7 +1052,7 @@ TOOL = {
                     "The exact action. Prefer this over `description` — pick one of: "
                     "volume_up | volume_down | volume_set | mute | "
                     "brightness_up | brightness_down | sleep_display | "
-                    "pause_video | close_app | close_window | full_screen | "
+                    "pause_video | close_window | full_screen | "
                     "minimize | maximize | snap_left | snap_right | "
                     "switch_window | show_desktop | task_manager | focus_search | "
                     "refresh_page | close_tab | new_tab | next_tab | prev_tab | "
