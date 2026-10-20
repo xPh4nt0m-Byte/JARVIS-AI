@@ -49,9 +49,51 @@ _BEHAVIORS = ("BLOCKING", "NON_BLOCKING")
 _SCHEDULING = ("WHEN_IDLE", "SILENT", "INTERRUPT")
 
 
+# Keys this project puts on a declaration for its own bookkeeping. They live
+# here because this file documents what a TOOL dict may contain, and both
+# loaders produce them.
+#
+# THEY MUST NEVER REACH A VENDOR. Gemini validates function declarations
+# against a fixed schema and an unknown field is an error, not something it
+# ignores — so main.py calls strip_meta() before building the Live config.
+#
+# The definition is here rather than in providers/schema.py, which is the only
+# other place that cares, because main.py must be able to strip them WITHOUT
+# importing providers: a default install never loads that package, and the
+# measured cost of deciding not to is the release's headline number.
+META_KEYS = ("tier", "brief")
+
+
+def strip_meta(decls):
+    """Declarations without META_KEYS. Non-dict entries pass through untouched;
+    a declaration carrying none is returned as the same object, so what an API
+    receives is byte-for-byte what it received before these keys existed."""
+    out = []
+    for decl in decls:
+        if isinstance(decl, dict) and any(k in decl for k in META_KEYS):
+            out.append({k: v for k, v in decl.items() if k not in META_KEYS})
+        else:
+            out.append(decl)
+    return out
+
+
 def _opt_upper(value, allowed: tuple[str, ...]) -> Optional[str]:
     v = str(value or "").strip().upper()
     return v if v in allowed else None
+
+def _opt_tier(value) -> Optional[str]:
+    """"core" or "extra" from a declaration, or None when it did not say.
+
+    Anything else is treated as "did not say" rather than as an error: a typo
+    should fall back to the default ranking, not stop a working tool loading.
+    """
+    text = str(value or "").strip().lower()
+    return text if text in ("core", "extra") else None
+
+
+def _opt_text(value) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
 
 
 @dataclass
@@ -65,6 +107,15 @@ class ActionRecord:
     error: str = ""
     behavior: Optional[str] = None     # None = the API's default (blocking)
     scheduling: Optional[str] = None   # None = the API's default (WHEN_IDLE)
+    # Read by providers/schema.py when a small model gets a tool budget; never
+    # sent to any API — main.py strips both before the Gemini config is built.
+    #   tier   "core" | "extra" — this file's own opinion of whether it should
+    #          survive a tight budget, instead of that being decided by the
+    #          order files happen to be discovered in.
+    #   brief  a short description used in place of the long one when a budget
+    #          is in force. Nothing is deleted: Gemini still gets the full text.
+    tier: Optional[str] = None
+    brief: Optional[str] = None
 
 
 class ActionRegistry:
@@ -81,6 +132,13 @@ class ActionRegistry:
                     "parameters": rec.parameters}
             if rec.behavior:
                 decl["behavior"] = rec.behavior
+            # Budget metadata. NOT part of any API's schema — main.py calls
+            # providers.schema.strip_meta() before the Gemini config is built,
+            # and budget() consumes them on the local-engine path.
+            if rec.tier:
+                decl["tier"] = rec.tier
+            if rec.brief:
+                decl["brief"] = rec.brief
             out.append(decl)
         return out
 
@@ -151,7 +209,9 @@ def _validate(module, filename: str) -> ActionRecord:
     return ActionRecord(name=name, description=description.strip(), parameters=parameters,
                         handler=handler, file=filename, valid=True, error="",
                         behavior=_opt_upper(tool.get("behavior"), _BEHAVIORS),
-                        scheduling=_opt_upper(tool.get("scheduling"), _SCHEDULING))
+                        scheduling=_opt_upper(tool.get("scheduling"), _SCHEDULING),
+                        tier=_opt_tier(tool.get("tier")),
+                        brief=_opt_text(tool.get("brief")))
 
 
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,

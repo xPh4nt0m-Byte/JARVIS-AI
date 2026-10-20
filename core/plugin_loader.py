@@ -33,6 +33,20 @@ def _opt_upper(value, allowed: tuple[str, ...]) -> Optional[str]:
     v = str(value or "").strip().upper()
     return v if v in allowed else None
 
+def _opt_tier(value) -> Optional[str]:
+    """"core" or "extra" from a declaration, or None when it did not say.
+
+    Anything else is treated as "did not say" rather than as an error: a typo
+    should fall back to the default ranking, not stop a working tool loading.
+    """
+    text = str(value or "").strip().lower()
+    return text if text in ("core", "extra") else None
+
+
+def _opt_text(value) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
 
 @dataclass
 class PluginRecord:
@@ -46,6 +60,15 @@ class PluginRecord:
     settings: Optional[dict] = None   # optional PLUGIN_SETTINGS schema (config fields)
     behavior: Optional[str] = None    # None = the API's default (blocking)
     scheduling: Optional[str] = None  # None = the API's default (WHEN_IDLE)
+    # Read by providers/schema.py when a small model gets a tool budget; never
+    # sent to any API — main.py strips both before the Gemini config is built.
+    #   tier   "core" | "extra" — this file's own opinion of whether it should
+    #          survive a tight budget, instead of that being decided by the
+    #          order files happen to be discovered in.
+    #   brief  a short description used in place of the long one when a budget
+    #          is in force. Nothing is deleted: Gemini still gets the full text.
+    tier: Optional[str] = None
+    brief: Optional[str] = None
 
 
 class PluginRegistry:
@@ -72,6 +95,13 @@ class PluginRegistry:
                 }
                 if rec.behavior:
                     decl["behavior"] = rec.behavior
+                # Budget metadata. NOT part of any API's schema — main.py calls
+                # providers.schema.strip_meta() before the Gemini config is
+                # built, and budget() consumes them on the local-engine path.
+                if rec.tier:
+                    decl["tier"] = rec.tier
+                if rec.brief:
+                    decl["brief"] = rec.brief
                 decls.append(decl)
         return decls
 
@@ -189,7 +219,31 @@ def _validate(module, filename: str) -> PluginRecord:
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
                          run=run_fn, file=filename, valid=True, error="", settings=settings,
                          behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
-                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING))
+                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING),
+                         tier=_opt_tier(plugin_meta.get("tier")),
+                         brief=_opt_text(plugin_meta.get("brief")))
+
+
+# The app's own top-level packages. Named explicitly rather than only probed on
+# disk, because the case that matters most is the folder being ABSENT: a plugin
+# importing core.undo on a build with no core/ at all must still be told to
+# update, not to install something called "core".
+_FIRST_PARTY = {"core", "memory", "actions", "plugins", "dashboard", "config"}
+
+
+def _is_first_party(top: str, plugins_dir: Path) -> bool:
+    """True when `top` names part of this app rather than a third-party package.
+
+    The disk probe is the second half so a package added to the project later is
+    recognised without anyone remembering to edit the set above.
+    """
+    if top in _FIRST_PARTY:
+        return True
+    root = plugins_dir.parent
+    try:
+        return (root / top).is_dir() or (root / f"{top}.py").is_file()
+    except OSError:
+        return False
 
 
 def _load_error(path: Path, plugins_dir: Path, exc: Exception) -> str:
@@ -213,6 +267,19 @@ def _load_error(path: Path, plugins_dir: Path, exc: Exception) -> str:
                     f"{plugins_dir.name}/. It comes with this plugin — download "
                     f"'{helper}' into the same folder as {path.name} and restart.")
         if missing and missing[0] not in ("plugins",):
+            if _is_first_party(missing[0], plugins_dir):
+                # 'pip install core' is not merely unhelpful — it is dangerous
+                # advice. These names belong to this project, and telling
+                # somebody to install a same-named stranger from an index is a
+                # supply-chain hazard dressed up as a fix. A plugin written
+                # against a newer JARVIS-AI reaches this line, and the honest answer
+                # is that the app is behind the plugin, not that a package is
+                # absent.
+                needed = "/".join(missing) + ".py"
+                return (f"Needs '{needed}', which is part of this app rather than "
+                        f"something to install — your copy doesn't have it, so it "
+                        f"comes with a newer version. Update the app; there is "
+                        f"nothing to pip install.")
             return (f"Needs a package that is not installed: "
                     f"pip install {missing[0]}")
     return f"Failed to load: {exc}"

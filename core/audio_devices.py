@@ -17,7 +17,7 @@ WHY NAMES, NOT INDICES
 
 WHY THIS IS CACHED
     `sd.query_devices()` talks to the host audio API and can take a few hundred
-    milliseconds on a Windows machine with many endpoints. Mark LV learned this
+    milliseconds on a Windows machine with many endpoints. JARVIS-AI learned this
     lesson the expensive way — a 2.1-second `openwakeword` import on the Qt
     thread made the settings drawer look like it was broken. So the list is
     fetched once on a background thread at startup and served from cache.
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Optional
 
 # The label shown for "let the OS decide", and the value stored in config for
 # it. Empty string, so an untouched install and a deliberately-default install
@@ -419,3 +420,271 @@ def resolve(name: str, kind: str):
     except Exception as e:
         print(f"[Audio] resolve({kind}) failed: {e} — using system default")
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  The one question automation cannot answer: is it hearing YOU?
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Everything above decides whether a device can be OPENED and whether it moves
+# audio, and it does that with silence so it can run at startup without anyone
+# noticing. That is not the same question as "is my microphone picking up my
+# voice", and it never will be: a muted mic, a level slider at zero, a headset
+# boom pointing at the ceiling and a privacy shutter all pass every automated
+# probe in this file and deliver nothing but a flat line.
+#
+# Only a person can answer that, by speaking. These two functions are what a
+# TEST button in the settings panel calls — measure what actually arrives, and
+# play something the user can confirm they heard.
+#
+# This began life as `ses_testi.py`, a loose script in the project root that
+# nobody would ever find. It is here because the moment somebody needs it is
+# the moment they have opened AUDIO DEVICES wondering why JARVIS cannot hear
+# them.
+
+# Below this peak, nothing usable arrived; below the second, speech is present
+# but so quiet that recognition will struggle. Both are int16 sample values,
+# taken from the levels a normal speaking voice produces at arm's length.
+_SILENT_PEAK = 100
+_QUIET_PEAK = 1500
+
+
+def measure_input(name: str, seconds: float = 3.0, on_level=None) -> dict:
+    """Record from one microphone and report what actually arrived.
+
+    -> {"ok", "peak", "level", "verdict"} — `level` is 0.0-1.0 for a meter,
+    `verdict` a short English sentence for the panel. Never raises: a device
+    that cannot be opened is a result, not an exception, because the user is
+    standing in front of the panel waiting for an answer either way.
+
+    `on_level(0.0-1.0)` is called as the audio arrives, roughly twenty times a
+    second, so the caller can move a meter WHILE the user is speaking.
+
+    THE METER IS NOT DECORATION.
+        The first version recorded for three seconds and then printed a
+        verdict. Reported as "I saw no sign of anything, no level, no
+        movement" — which is exactly right: three seconds of a static label
+        reading "Speak now" is indistinguishable from a test that has hung.
+        A person needs to see the thing respond to their voice to believe it
+        is listening, and that is the entire point of the button.
+    """
+    idx = resolve(name, "input")
+    peak_seen = [0]
+    try:
+        import numpy as np
+        import sounddevice as sd
+
+        rate = _RATES.get("input", 16000)
+
+        def _cb(indata, _frames, _t, _status):
+            block = int(np.abs(np.frombuffer(indata, dtype="int16")).max())                 if len(indata) else 0
+            if block > peak_seen[0]:
+                peak_seen[0] = block
+            if on_level is not None:
+                try:
+                    on_level(min(1.0, block / 12000.0))
+                except Exception:
+                    pass
+
+        stream = sd.RawInputStream(samplerate=rate, channels=1, dtype="int16",
+                                   blocksize=int(rate / 20), device=idx,
+                                   callback=_cb)
+        with stream:
+            time.sleep(max(0.5, float(seconds)))
+        peak = peak_seen[0]
+    except Exception as e:
+        return {"ok": False, "peak": 0, "level": 0.0,
+                "verdict": f"This microphone could not be opened: {e}"}
+
+    if peak < _SILENT_PEAK:
+        verdict = ("Nothing arrived. The microphone is muted, its level is at "
+                   "zero, or this is not the device you are speaking into.")
+    elif peak < _QUIET_PEAK:
+        verdict = ("Very quiet. Speech recognition will struggle — raise the "
+                   "input level in the system sound settings.")
+    else:
+        verdict = "Working. Your voice is coming through clearly."
+
+    return {"ok": peak >= _QUIET_PEAK, "peak": peak,
+            "level": min(1.0, peak / 12000.0), "verdict": verdict}
+
+
+def play_tone(name: str, seconds: float = 0.6) -> dict:
+    """Play a short tone through one output so the user can confirm they hear it.
+
+    -> {"ok", "verdict"}. There is no way to check this from software — the
+    silent-sink probe above proves audio was CONSUMED, not that a speaker made
+    a sound — so the answer comes from the person, and this only makes the
+    sound for them to answer about.
+    """
+    idx = resolve(name, "output")
+    try:
+        import numpy as np
+        import sounddevice as sd
+
+        rate = _RATES.get("output", 24000)
+        t = np.linspace(0, seconds, int(rate * seconds), endpoint=False)
+        # 660 Hz, well inside every speaker's range and unmistakable against
+        # room noise. Quiet enough not to startle somebody wearing headphones.
+        tone = (np.sin(2 * np.pi * 660 * t) * 6000).astype(np.int16)
+        sd.play(tone, samplerate=rate, device=idx)
+        sd.wait()
+    except Exception as e:
+        return {"ok": False, "verdict": f"This output could not be played: {e}"}
+    return {"ok": True, "verdict": "Tone played. Did you hear it?"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Output volume, so the panel can set it where the device is chosen
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Choosing "Realtek(R) Audio" in this panel and then finding it far too quiet
+# means going to the system sound settings, finding the same endpoint again and
+# moving a slider there — reported as exactly that annoyance. The volume
+# belongs beside the device it applies to.
+#
+# These delegate to actions/computer_settings, which already owns the
+# per-platform volume plumbing and had a real bug in it (see
+# _win_endpoint_volume there). One implementation, not two.
+
+def _endpoint_for(name: str):
+    """The Windows volume interface for ONE named output, or None.
+
+    WHY THIS IS NOT JUST THE DEFAULT DEVICE
+        The first version set the system's default endpoint, so moving the
+        slider in this panel changed the volume of whichever output Windows
+        happened to consider default — not the one chosen two lines above it.
+
+        That is wrong in a way that matters to how people actually use this:
+        somebody puts the assistant on their speakers and keeps everything else
+        in their headphones, and a slider labelled with one device silently
+        moving the other is worse than having no slider.
+
+        It also explains a complaint that looked separate. The selected output
+        here was sitting at 10% while the default endpoint was at 100% — so the
+        assistant was almost inaudible, and the slider "fixed" it by turning up
+        something the user could not hear either.
+
+    Matching is by the name Windows itself reports, which is the same string
+    sounddevice lists, folded so case and punctuation cannot separate them.
+    """
+    if _platform_is() != "Windows" or not name:
+        return None
+    try:
+        from pycaw.pycaw import AudioUtilities
+        wanted = _fold(name)
+        if not wanted:
+            return None
+
+        # Collect first, decide after. An earlier version returned the first
+        # candidate that matched on a PREFIX, which meant a loosely-similar
+        # name could win over the exact one simply by coming first in the
+        # enumeration — and the slider then moved a device the user had not
+        # chosen. Exact wins, always; the prefix pass exists only because MME
+        # truncates long names to 31 characters.
+        exact, partial = None, None
+        for dev in AudioUtilities.GetAllDevices():
+            # ONLY ACTIVE ENDPOINTS, AND THIS IS NOT A TIDINESS FILTER.
+            #
+            # Windows keeps a record of hardware that is no longer here, and it
+            # keeps the SAME FRIENDLY NAME. Measured on this machine, two
+            # devices answered to "Hoparlör (Realtek(R) Audio)": one
+            # NotPresent sitting at 100%, and the real one, Active, at 10%.
+            # Matching by name alone returned whichever came first — so the
+            # panel read 100% for a speaker that was actually at 10%, and
+            # setting it moved a device that does not exist.
+            try:
+                if str(getattr(dev, "state", "")) != "AudioDeviceState.Active":
+                    continue
+            except Exception:
+                continue
+            try:
+                # Reading this property activates a COM interface and raises
+                # for devices that are unplugged or disabled — normal, and not
+                # worth a line in the log for each one.
+                endpoint = dev.EndpointVolume
+            except Exception:
+                continue
+            if endpoint is None:
+                continue
+            try:
+                friendly = _fold(getattr(dev, "FriendlyName", "") or "")
+            except Exception:
+                continue
+            if not friendly:
+                continue
+            if friendly == wanted:
+                exact = endpoint
+                break
+            if partial is None and (friendly.startswith(wanted[:24])
+                                    or wanted.startswith(friendly[:24])):
+                partial = endpoint
+        return exact or partial
+    except Exception as e:
+        print(f"[Audio] per-device volume unavailable: {e}")
+    return None
+
+
+def _platform_is() -> str:
+    import platform
+    return platform.system()
+
+
+def _fold(text: str) -> str:
+    """Same reduction core/appidentity uses for application names — imported
+    lazily so this module keeps working if that one is ever absent."""
+    try:
+        from core.appidentity import fold
+        return fold(text)
+    except Exception:
+        return "".join(c for c in str(text or "").lower() if c.isalnum())
+
+
+def get_output_volume(name: str = "") -> Optional[int]:
+    """Volume 0-100 of ONE output, or of the system default when unnamed.
+
+    None where the platform will not report it — macOS and Linux have no
+    per-device volume through this plumbing, so a name there falls back to the
+    master level rather than silently answering about the wrong device.
+    """
+    endpoint = _endpoint_for(name)
+    if endpoint is not None:
+        try:
+            return max(0, min(100, round(
+                endpoint.GetMasterVolumeLevelScalar() * 100)))
+        except Exception as e:
+            print(f"[Audio] could not read '{name}' volume: {e}")
+    try:
+        from actions.computer_settings import volume_get
+        return volume_get()
+    except Exception as e:
+        print(f"[Audio] could not read the output volume: {e}")
+        return None
+
+
+def set_output_volume(percent: int, name: str = "") -> bool:
+    """Set ONE output's volume 0-100. -> did it take.
+
+    Falls back to the system master only when the named device cannot be
+    reached, and says so, because silently moving a different device's volume
+    is the bug this function exists to fix.
+    """
+    percent = max(0, min(100, int(percent)))
+    endpoint = _endpoint_for(name)
+    if endpoint is not None:
+        try:
+            endpoint.SetMasterVolumeLevelScalar(percent / 100.0, None)
+            return True
+        except Exception as e:
+            print(f"[Audio] could not set '{name}' volume: {e}")
+    if name:
+        print(f"[Audio] '{name}' has no separate volume control here — "
+              f"setting the system level instead.")
+    try:
+        from actions.computer_settings import volume_set, volume_get
+        volume_set(percent)
+        now = volume_get()
+        return now is None or abs(now - percent) <= 3
+    except Exception as e:
+        print(f"[Audio] could not set the output volume: {e}")
+        return False
